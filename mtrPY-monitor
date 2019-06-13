@@ -1,0 +1,359 @@
+from multiprocessing import Pool, Manager, cpu_count
+from Queue import Empty
+from subprocess import Popen, PIPE
+from operator import attrgetter
+from datetime import datetime
+from json import dumps
+import shlex
+import pipes
+import time
+import sys
+import re
+
+from numpy import int32, float64, nan
+from pandas import DataFrame
+from pandas import Timestamp
+from pandas import HDFStore # Req: libhdf5-dev, cython, numexpr, PyTables
+# matplotlib requires:
+# - Python libraries
+#  - nose
+#  - tornado
+#  - pyparsing
+#
+# - System libraries
+#  - libfreetype6-dev (freetype2)
+#  - libcairo2-dev (libcairo)
+#  - libpng
+#  - libagg
+from matplotlib import pyplot
+import matplotlib
+
+
+"""
+
+# Logical flow:
+#
+#    MonitorHosts()
+#         |
+#         | Collect stats and store in hdf5 format
+#         |
+#         V
+#     IterRunMP()
+#         |
+#         | work = [MtrHostJob(), MtrHostJob(), ...]
+#         |
+#         V
+#         Spawn:
+#            JobExecQueueMP(MtrHostJob())  <---- new Python Process
+#            JobExecQueueMP(MtrHostJob())  <---- new Python Process
+#            ...
+#
+# IterRunMP.drain_job_queue() dequeues a list of finished MtrHostJob objects 
+# into IterRunMP.result
+
+class MonitorHosts(object):
+    def __init__(self, hosts=None, cycles=60, udp=False, 
+        timezone="GMT", hdf5_file='store.h5'):
+        if not isinstance(hosts, dict):
+            raise ValueError, "MonitorHosts() hosts arg must be a dictionary of hosts, example: MonitorHosts(hosts={'host1': '1.1.1.1', 'host2', '1.1.1.2'})"
+
+        self.hosts = hosts
+        # Create an empty DataFrame with the correct columns
+        datacolumns = ('host', 'hop', 'addr', 'timestamp', 'sent', 'drop', 
+            'best', 'avg', 'worst', 'flap')
+        index = ['host', 'hop', 'addr']
+        self.df = None
+        log = RotatingFile()
+        log.open()
+
+        ## Build an empty result dictionary
+        result = dict()
+        for col in datacolumns:
+            result[col] = list()
+
+        try:
+            # Run mtr in an endless loop until the program exits with Cntl-C
+            while True:
+                # IterRunMP.result contains a list of MtrHostJob() instances
+                finished = IterRunMP(hosts=hosts, cycles=cycles, udp=udp, 
+                    timezone=timezone)
+
+                # Update the result dict with each mtr run...
+                for job in finished.result:
+                    # Get each mtr hop result...
+                    for row in job.result:
+                        # Fill in parameters for each hop
+                        for key, val in row.dictionary.items():
+                            result[key].append(val)
+                    for entry in job.logs:
+                        log.write(entry+os.linesep)
+
+        except KeyboardInterrupt:
+            self.store_results(result=result, index=index, columns=datacolumns,
+                hdf5_file=hdf5_file)
+
+        log.close()
+
+    def store_results(self, result, index, columns, hdf5_file):
+        self.df = DataFrame(result, columns=columns)
+        self.df = self.df.set_index(index)
+        self.df.sort_index(inplace=True)
+
+        # Store the DataFrame as an HDF5 file...
+        hdf = HDFStore(hdf5_file)
+        # Append the dataframe, and ensure addr / host can be 17 chars long
+        hdf.append('df', self.df, data_columns=list(columns), 
+            min_itemsize={'addr': 17, 'host': 17})
+        hdf.close()
+
+class IterRunMP(object):
+    def __init__(self, hosts=None, cycles=60, udp=False, timezone="GMT"):
+        """Build a pool of python processes, and execute a MtrHostJob() in each 
+        pool"""
+        if not isinstance(hosts, dict):
+            raise ValueError, "IterRunMP() hosts arg must be a dictionary of hosts, example: MtrRunMP(hosts={'host1': '1.1.1.1', 'host2', '1.1.1.2'})"
+        self.result = None  # Finished Multiprocessing jobs are stored here
+        self.hosts = hosts
+
+        work = list()  # A list of job objects
+        for name, host in hosts.items():
+            # Build a list of class instances to run()
+            work.append(MtrHostJob(name=name, host=host, cycles=cycles, 
+                udp=udp, timezone=timezone))
+
+        pool = Pool(processes=len(hosts.keys()))
+        pool_mgr = Manager()
+        q = pool_mgr.Queue()   # Central multiprocessing result queue
+        # Multiprocessing for each job.run() is in JobExecQueueMP()
+        pool.imap_unordered(JobExecQueueMP, [(job, q) for job in work])
+        self.result = self.drain_job_queue(q, work)
+
+        pool.close()
+        pool.join()
+
+    def drain_job_queue(self, queue, work):
+        result = list()  # A list of jobs done
+        # Monitor the multiprocessing queue
+        while not (queue.empty()) or (len(result)<len(work)):
+            try:
+                job = queue.get_nowait()
+                result.append(job)
+            except Empty:
+                pass
+            except Exception, e:
+                print "Caught", e
+                sys.exit(1)
+        return result
+
+    def __repr__(self):
+        return "<MtrRunMP {0} hosts>".format(len(self.hosts.keys()))
+
+class JobExecQueueMP(object):
+    def __init__(self, args):
+        """Run a job using Python Multiprocessing; this class spawns itself in 
+        a separate python process. Upon execution, test whether the job is 
+        valid and run it.  Always add the finished job to the result queue."""
+        job, queue = args[0], args[1]
+        try:
+            if job.valid():
+                job.run()
+                queue.put(job)
+            else:
+                queue.put(job)
+        except Exception, e:
+            job.exception = e
+            queue.put(job)
+
+class MTR_Hop(object):
+    def __init__(self, host="", hop=0, addr="", sent=0, drop=0, best=0.0, 
+        avg=0.0, worst=0.0, timestamp=None, flap=False):
+        self.host = host           # host ip address of the end host
+        self.hop = int32(hop)      # Hop number
+        self.addr = addr           # ip address of the hop
+        self.sent = int32(sent)
+        self.drop = int32(drop)
+        self.best = float64(best)
+        self.avg = float64(avg)
+        self.worst = float64(worst)
+        self.drop_ratio = float64(self.drop/self.sent)
+        self.pct_drop_str = "%0.3f" % (self.drop_ratio*100)
+        self.timestamp = timestamp # mtr path flap on this hop
+        self.flap = flap   # mtr path flap on this hop
+
+    @property
+    def dictionary(self):
+        # I am intentionally leaving drop_ratio out
+        return {'host': self.host,
+            'hop': self.hop,
+            'addr': self.addr,
+            'timestamp': self.timestamp,
+            'sent': self.sent,
+            'drop': self.drop,
+            'best': self.best,
+            'avg': self.avg,
+            'worst': self.worst,
+            'flap': self.flap,
+            }
+
+    @property
+    def csv(self):
+        return "{0},{1},{2},{3},{4},{5},{6},{7},{8}".format(self.host,
+            self.hop, self.addr, self.timestamp, self.sent, self.drop, 
+            self.best, self.avg, self.worst)
+
+    def __repr__(self):
+        return "<MTR_Hop {0} to {1}: {2}, {3}% drop, {4} avg>".format(self.hop, 
+            self.host, self.addr, self.pct_drop_str, self.avg)
+
+    @property
+    def json(self):
+        return dumps(self.dictionary)
+
+class MtrHostJob(object):
+    def __init__(self, name="", host="", cycles=60, udp=False, timezone="GMT", 
+        unittest=""):
+        self.name = name
+        self.host = host
+        self.cycles = cycles
+        self.udp = udp
+        self.timezone = timezone
+        self.unittest = unittest
+
+        self.start_time = Timestamp('now', tz=timezone)  # MTR start time
+        self.end_time   = self.start_time                # MTR end time
+
+        self.is_valid = False
+        self.exception = ""
+        self.result = list()
+        self.logs = list()
+
+    def run(self):
+        """Most Job execution should happen here"""
+        if self.unittest:
+            lines = self.unittest.split('\n')
+        else:
+            options = """-o "SD NBAW" --no-dns --report -c {0}""".format(self.cycles)
+            if self.udp:
+                options += " -u"
+
+            cmdstr = 'mtr {0} {1}'.format(options, self.host)
+            # pipes.quote() is required to escape the quotes in cmdstr
+            cmd = Popen(shlex.split(pipes.quote(cmdstr)), shell=True,
+                stdout=PIPE)
+            lines = cmd.stdout.readlines()
+            self.end_time = Timestamp('now', tz=self.timezone)
+
+        # Parse here for precompiled efficiency instead of in MTR_Hop()
+        # 3.|-- 99.50.236.2                   5    0    5.2   5.2  11.0  31.3
+        rgx_noflap = re.compile(r'\s*(\d+).+?(\d+\.\d+\.\d+\.\d+|\?+)\s+(\d+)\s+(\d+)\s+(\d+\.*\d*)\s+(\d+\.*\d*)\s+(\d+\.*\d*)\s+(\d+\.*\d*)')
+        print '\n'.join(lines)
+        for line in lines:
+            mm = rgx_noflap.search(line.strip())
+            if not (mm is None):
+                hop = int(mm.group(1))
+                addr = mm.group(2)
+                sent = int(mm.group(3))
+                drop = int(mm.group(4))
+                best = mm.group(6)
+                avg = mm.group(7)
+                worst = mm.group(8)
+            else:
+                hop = None
+                addr = None
+                sent = None
+                drop = None
+                best = None
+                avg = None
+                worst = None
+
+            if not (hop is None) and (drop<sent):
+                hop = MTR_Hop(host=self.host, hop=hop, addr=addr, sent=sent, 
+                    drop=drop, best=best, avg=avg, worst=worst, 
+                    timestamp=self.start_time, flap=False)
+                self.result.append(hop)  # Add the hop to the list of hops
+            elif not (hop is None) and (drop==sent):
+                hop = MTR_Hop(host=self.host, hop=hop, addr=addr, sent=sent, 
+                    drop=drop, best=nan, avg=nan, worst=nan, 
+                    timestamp=self.start_time, flap=False)
+                self.result.append(hop)  # Add the hop to the list of hops
+
+        return self.result
+
+    def valid(self):
+        if isinstance(self.cycles, int):
+            self.is_valid = True
+            return True
+        return False
+
+    @property
+    def list_of_dicts(self):
+        return [ii.dictionary for ii in self.result]
+
+    @property
+    def json_result(self):
+        return dumps(self.list_of_dicts)
+
+    def __repr__(self):
+        delta = self.end_time - self.start_time
+        return "<MtrHostJob {0} drop {1}%, ran {2} seconds>".format(self.host, 
+            self.result[-1].pct_drop_str, delta.seconds)
+
+class RotatingFile(object):
+    def __init__(self, directory='', filename='log.txt', max_files=sys.maxint,
+        max_file_size=50000):
+        self.ii = 1
+        self.directory, self.filename      = directory, filename
+        self.max_file_size, self.max_files = max_file_size, max_files
+        self.finished, self.fh             = False, None
+        self.open()
+
+    def rotate(self):
+        """Rotate the file, if necessary"""
+        if (os.stat(self.filename_template).st_size>self.max_file_size):
+            self.close()
+            self.ii += 1
+            if (self.ii<=self.max_files):
+                self.open()
+            else:
+                self.close()
+                self.finished = True
+
+    def open(self):
+        self.fh = open(self.filename_template, 'w')
+
+    def write(self, text=""):
+        self.fh.write(text)
+        self.fh.flush()
+        self.rotate()
+
+    def close(self):
+        self.fh.close()
+
+    @property
+    def filename_template(self):
+        return self.directory + self.filename + "_%0.2d" % self.ii
+
+if __name__=="__main__":
+    hosts = MonitorHosts(hosts={'dns1':"4.2.2.2", 'dns2': "8.8.8.8",},
+        timezone="America/Chicago", cycles=10)
+
+    # Find all entries matching best<10.0
+    print hosts.df['best']<10.0
+
+    # Building a plot with pandas wrappers around matplotlib.pyplot
+    matplotlib.use('agg')
+    #pyplot.rc('font', size=14)
+    #pyplot.rc('axes', grid=True)
+    #pyplot.rc('axes', grid=True)
+    #pyplot.rc('grid', color='0.75', linestyle='-', linewidth=0.5)
+
+    # Aggregate all datapoints for 172.16.1.1 for each common timestamp
+    #    groupby() indexes the "data" variable by the "timestamp" column
+    data = hosts.df.xs('172.16.1.1', level='addr').groupby('timestamp').mean()
+
+    title = "MTR Response time to 172.16.1.1"
+    data['avg'].plot(linestyle='solid', lw=4, marker='o', color='blue', 
+        legend=True, title=title)
+    data['worst'].plot(linestyle='dashed', color='red', 
+        legend=True, title=title)
+    pyplot.savefig('line_plot.png')
